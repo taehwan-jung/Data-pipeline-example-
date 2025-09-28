@@ -1,0 +1,108 @@
+from pyspark.sql import SparkSession
+import logging
+import pyspark.sql.functions as F
+from pyspark.sql import types as T
+from pyspark.sql.types import StructType, StructField, IntegerType, StringType, LongType, DateType
+from pyspark.sql.functions import lit, to_date, col, to_timestamp, year
+
+
+# logging 설정
+logging.basicConfig(
+    level=logging.INFO)
+
+# spark 세션 설정
+spark = SparkSession.builder \
+    .appName("Airflow") \
+    .getOrCreate()
+
+
+# AWS S3 리전설정
+REGION_ENDPOINT = "s3.ap-northeast-2.amazonaws.com"  
+BUCKET = "<bucket>"
+
+# hadoopConfig로 연결 
+try:
+    hconf = spark.sparkContext._jsc.hadoopConfiguration()
+    hconf.set("fs.s3a.endpoint", REGION_ENDPOINT)
+    hconf.set("fs.s3a.path.style.access", "true")
+    logging.info("AWS S3 연결 성공")
+except Exception as e:
+    logging.error(f"Error: {e}")
+    raise
+
+try:
+    # S3에서 csv,json 읽기
+    users_df = spark.read \
+        .option("header", "true") \
+        .option("inferSchema", "true") \
+        .csv(f"s3a://{bucket}/users_1.csv")
+
+    orders_df = spark.read \
+        .option("inferSchema", "true") \
+        .option("multiLine", "true") \
+        .json(f"s3a://{bucket}/orders.json")
+
+    logging.info("S3 파일 로드 성공")
+except Exception as e:
+    logging.error("S3 파일 로드 실패")
+    raise
+
+# 컬럼추가
+users = (users_df
+        .withColumn("signup_ts_parsed", to_timestamp(col("signup_ts"), "yyyy.M.d H:mm"))
+        .withColumn("signup_year", year(col("signup_ts_parsed")).cast("int"))
+)
+orders = orders_df.withColumn("order_date", F.to_date("order_ts", "yyyy-MM-dd HH:mm:ss"))
+
+
+# join
+df_join = orders.join(users, on="user_id", how="inner")
+final_df = df_join.select(
+    "order_id", "user_id", "name", "gender", "signup_year", "order_date", "amount"
+)
+
+
+# Final_df
+final_df.show(truncate=False)
+
+# Filtering
+df_filtered = final_df.filter(F.col("amount") >= 100)
+#display(df_filtered)
+
+
+# UDF
+def segment(year):
+    try:
+        y = int(year)
+        if y < 2020:
+            return "old"
+        elif y >= 2020 and y <= 2022:
+            return "mid"
+        else:
+            return "new"
+    except Exception as e:
+        return e
+    
+# UDF 등록
+user_segment = F.udf(segment, T.StringType())
+
+# "user_segment"컬럼추가
+users_segment_df = df_filtered.withColumn("user_segment", user_segment(F.col("signup_year")))
+users_segment_df.show(truncate=False)
+
+# 최종결과 sparksql로 조회
+
+df_filtered.createOrReplaceTempView("users_base")
+
+spark.sql("""
+SELECT
+  user_id,
+  signup_year,
+  amount,
+  CASE
+    WHEN CAST(signup_year AS INT) < 2020 THEN 'OLD'
+    WHEN CAST(signup_year AS INT) BETWEEN 2020 AND 2022 THEN 'MID'
+    WHEN CAST(signup_year AS INT) >= 2023 THEN 'NEW'
+  END AS user_segment
+FROM users_base
+""").show()
