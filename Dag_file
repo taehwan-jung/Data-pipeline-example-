@@ -1,0 +1,34 @@
+from airflow import DAG
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from airflow.utils.dates import days_ago
+
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "email_on_failure": False,
+    "email_on_retry": False,
+}
+ 
+with DAG(
+    dag_id="daily_user_order_processing",
+    default_args=default_args,
+    description="매일 오후 7시에 30분에 Spark ETL 스크립트를 실행하는 DAG",
+    schedule_interval="30 19 * * *",  
+    start_date=days_ago(1),
+    catchup=False,
+    tags=["spark", "batch"],
+) as dag:
+ 
+    run_spark_etl = SparkSubmitOperator(
+        task_id="run_user_order_etl",
+        application="/var/lib/airflow/scripts/spark_etl.py",  
+        conn_id="spark_default",
+        packages="org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262",                        
+        verbose=True,
+        application_args=[
+            "--users",  "s3a://databricks-s3-spark-2/users_1.csv",
+            "--orders", "s3a://databricks-s3-spark-2/orders.json"
+        ],
+    )
+run_spark_etl
+
